@@ -1,0 +1,836 @@
+<!DOCTYPE html>
+<html lang="ar">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>محاكاة شجرة الويستريا — WebGL2</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    background: #060209;
+    overflow: hidden;
+    font-family: -apple-system, 'Segoe UI', Tahoma, sans-serif;
+  }
+  #glcanvas {
+    position: fixed; inset: 0;
+    width: 100%; height: 100%;
+    display: block;
+    cursor: grab;
+  }
+  #glcanvas:active { cursor: grabbing; }
+  #loading {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: 16px;
+    background: #060209;
+    color: #cda9e0;
+    z-index: 10;
+    transition: opacity 0.9s ease;
+    font-size: 13px; letter-spacing: 1px;
+  }
+  #loading .spinner {
+    width: 34px; height: 34px; border-radius: 50%;
+    border: 2px solid rgba(205,169,224,0.15);
+    border-top-color: #cda9e0;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #hint {
+    position: fixed; bottom: 24px; left: 50%;
+    transform: translateX(-50%);
+    color: rgba(230, 210, 240, 0.5);
+    font-size: 12px; letter-spacing: 0.5px;
+    z-index: 5;
+    transition: opacity 1.4s ease;
+    pointer-events: none;
+    text-align: center;
+  }
+  .fade-out { opacity: 0 !important; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+<div id="loading"><div class="spinner"></div><div>جاري إنبات الشجرة...</div></div>
+<div id="hint">اسحب للتدوير &nbsp;·&nbsp; العجلة للتقريب</div>
+
+<script>
+'use strict';
+
+/* ============================================================
+   CONFIG — tune the look here
+   ============================================================ */
+const CFG = {
+  trunkHeight: 1.9,
+  trunkRadius: 0.22,
+  maxDepth: 9,
+  minRadius: 0.008,
+  maxFlorets: 28000,
+  floretSize: 0.055,
+  windStrength: 0.11,
+  windSpeed: 1.0,
+  reflectionScale: 0.5,
+  maxDPR: 1.5,
+  fov: 45 * Math.PI / 180,
+  near: 0.07,
+  far: 50
+};
+
+/* ============================================================
+   Small vector helpers (no external math library, by design)
+   ============================================================ */
+function addV(a,b){ return [a[0]+b[0], a[1]+b[1], a[2]+b[2]]; }
+function subV(a,b){ return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]; }
+function crossV(a,b){
+  return [
+    a[1]*b[2]-a[2]*b[1],
+    a[2]*b[0]-a[0]*b[2],
+    a[0]*b[1]-a[1]*b[0]
+  ];
+}
+function lenV(a){ return Math.hypot(a[0],a[1],a[2]); }
+function normV(a){
+  const l = lenV(a) || 1;
+  return [a[0]/l, a[1]/l, a[2]/l];
+}
+function clampN(x,lo,hi){ return Math.max(lo, Math.min(hi, x)); }
+function randRange(lo,hi){ return lo + Math.random()*(hi-lo); }
+
+function randomConeDir(baseDir, maxAngle){
+  const base = normV(baseDir);
+  const arbitrary = Math.abs(base[1]) < 0.9 ? [0,1,0] : [1,0,0];
+  const t1 = normV(crossV(base, arbitrary));
+  const t2 = crossV(base, t1);
+  const theta = Math.random()*Math.PI*2;
+  const phi = Math.random()*maxAngle;
+  const s = Math.sin(phi), c = Math.cos(phi);
+  return normV([
+    base[0]*c + (t1[0]*Math.cos(theta)+t2[0]*Math.sin(theta))*s,
+    base[1]*c + (t1[1]*Math.cos(theta)+t2[1]*Math.sin(theta))*s,
+    base[2]*c + (t1[2]*Math.cos(theta)+t2[2]*Math.sin(theta))*s
+  ]);
+}
+
+function shuffleArray(arr){
+  for (let i=arr.length-1; i>0; i--){
+    const j = Math.floor(Math.random()*(i+1));
+    const tmp = arr[i]; arr[i]=arr[j]; arr[j]=tmp;
+  }
+  return arr;
+}
+
+/* ============================================================
+   4x4 matrix helpers (column-major, Float32Array(16))
+   ============================================================ */
+const M4 = {
+  create(){ return new Float32Array(16); },
+  identity(out){
+    out.set([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+    return out;
+  },
+  perspective(out, fovy, aspect, near, far){
+    const f = 1/Math.tan(fovy/2);
+    out.set([
+      f/aspect,0,0,0,
+      0,f,0,0,
+      0,0,(far+near)/(near-far),-1,
+      0,0,(2*far*near)/(near-far),0
+    ]);
+    return out;
+  },
+  lookAt(out, eye, center, up){
+    let z0=eye[0]-center[0], z1=eye[1]-center[1], z2=eye[2]-center[2];
+    let len = Math.hypot(z0,z1,z2) || 1;
+    z0/=len; z1/=len; z2/=len;
+
+    let x0 = up[1]*z2-up[2]*z1;
+    let x1 = up[2]*z0-up[0]*z2;
+    let x2 = up[0]*z1-up[1]*z0;
+    len = Math.hypot(x0,x1,x2);
+    if (len < 1e-6){ x0=1;x1=0;x2=0; } else { x0/=len; x1/=len; x2/=len; }
+
+    const y0 = z1*x2-z2*x1;
+    const y1 = z2*x0-z0*x2;
+    const y2 = z0*x1-z1*x0;
+
+    out.set([
+      x0,y0,z0,0,
+      x1,y1,z1,0,
+      x2,y2,z2,0,
+      -(x0*eye[0]+x1*eye[1]+x2*eye[2]),
+      -(y0*eye[0]+y1*eye[1]+y2*eye[2]),
+      -(z0*eye[0]+z1*eye[1]+z2*eye[2]),
+      1
+    ]);
+    return out;
+  }
+};
+
+/* ============================================================
+   Shaders (GLSL ES 3.00 / WebGL2)
+   ============================================================ */
+const TRUNK_VS = `#version 300 es
+precision highp float;
+in vec3 aPosition;
+in vec3 aNormal;
+uniform mat4 uView;
+uniform mat4 uProj;
+out vec3 vNormal;
+out vec3 vWorldPos;
+void main(){
+  vWorldPos = aPosition;
+  vNormal = aNormal;
+  gl_Position = uProj * uView * vec4(aPosition, 1.0);
+}`;
+
+const TRUNK_FS = `#version 300 es
+precision highp float;
+in vec3 vNormal;
+in vec3 vWorldPos;
+uniform vec3 uCameraPos;
+out vec4 fragColor;
+void main(){
+  vec3 N = normalize(vNormal);
+  vec3 V = normalize(uCameraPos - vWorldPos);
+  vec3 skyDir = normalize(vec3(0.3, 1.0, 0.4));
+
+  float diff = max(dot(N, skyDir), 0.0);
+  float fresnel = pow(clamp(1.0 - max(dot(N,V),0.0), 0.0, 1.0), 2.5);
+
+  vec3 baseColor = mix(vec3(0.045,0.032,0.040), vec3(0.115,0.078,0.062), clamp(vWorldPos.y*0.4,0.0,1.0));
+
+  float mossT = 1.0 - smoothstep(0.0, 0.55, vWorldPos.y);
+  baseColor = mix(baseColor, vec3(0.075,0.10,0.058), mossT*0.5);
+
+  vec3 color = baseColor * (0.14 + diff*0.85);
+  color += fresnel * vec3(0.55,0.35,0.70) * 0.55;
+  color += vec3(0.5,0.4,0.6) * fresnel * 0.15;
+
+  fragColor = vec4(color, 1.0);
+}`;
+
+const FLORET_VS = `#version 300 es
+precision highp float;
+in vec2 aCorner;
+in vec2 aUV;
+in vec3 iBasePos;
+in float iPhase;
+in float iHeightT;
+in float iScale;
+in float iSeed;
+
+uniform mat4 uView;
+uniform mat4 uProj;
+uniform float uTime;
+uniform float uWindStrength;
+uniform float uWindSpeed;
+
+out vec2 vUV;
+out float vHeightT;
+out float vSeed;
+
+void main(){
+  vec3 right = vec3(uView[0][0], uView[1][0], uView[2][0]);
+  vec3 up    = vec3(uView[0][1], uView[1][1], uView[2][1]);
+
+  float swayAmt = 0.22 + iHeightT*0.9;
+  float sway  = sin(uTime*uWindSpeed + iPhase) * uWindStrength * swayAmt;
+  float swayZ = cos(uTime*uWindSpeed*0.72 + iPhase*1.31) * uWindStrength * 0.55 * swayAmt;
+  float bob   = sin(uTime*1.6 + iPhase*2.0) * 0.012 * iHeightT;
+
+  vec3 worldPos = iBasePos + vec3(sway, bob, swayZ);
+
+  float ang = iSeed * 6.2831853;
+  float ca = cos(ang), sa = sin(ang);
+  vec2 rc = vec2(aCorner.x*ca - aCorner.y*sa, aCorner.x*sa + aCorner.y*ca);
+
+  worldPos += right * (rc.x * iScale) + up * (rc.y * iScale);
+
+  vUV = aUV;
+  vHeightT = iHeightT;
+  vSeed = iSeed;
+  gl_Position = uProj * uView * vec4(worldPos, 1.0);
+}`;
+
+const FLORET_FS = `#version 300 es
+precision highp float;
+in vec2 vUV;
+in float vHeightT;
+in float vSeed;
+out vec4 fragColor;
+
+void main(){
+  vec2 p = vUV*2.0 - 1.0;
+  vec2 shapeP = vec2(p.x, p.y/1.3);
+  float d = length(shapeP);
+  if (d > 1.0) discard;
+
+  float nz = sqrt(max(0.0, 1.0 - p.x*p.x - p.y*p.y));
+  vec3 N = normalize(vec3(p.x, p.y, nz));
+  vec3 L = normalize(vec3(0.3, 0.6, 0.75));
+  float diff = max(dot(N,L), 0.0);
+  float rim = pow(clamp(1.0-nz,0.0,1.0), 2.0);
+
+  vec3 deep = vec3(0.34,0.12,0.50);
+  vec3 light = vec3(0.86,0.68,0.93);
+  vec3 base = mix(deep, light, clamp(vHeightT*1.15,0.0,1.0));
+  base = mix(base, base*vec3(1.08,0.92,1.05), fract(vSeed*13.7));
+
+  vec3 color = base * (0.38 + diff*0.75);
+  color += rim * vec3(0.9,0.75,0.95) * 0.4;
+
+  float alpha = 1.0 - smoothstep(0.65, 1.0, d);
+  fragColor = vec4(color, alpha*0.92);
+}`;
+
+const WATER_VS = `#version 300 es
+precision highp float;
+in vec3 aPosition;
+uniform mat4 uView;
+uniform mat4 uProj;
+out vec4 vClipPos;
+out vec2 vWorldXZ;
+void main(){
+  vWorldXZ = aPosition.xz;
+  vec4 clip = uProj * uView * vec4(aPosition,1.0);
+  vClipPos = clip;
+  gl_Position = clip;
+}`;
+
+const WATER_FS = `#version 300 es
+precision highp float;
+in vec4 vClipPos;
+in vec2 vWorldXZ;
+uniform sampler2D uReflection;
+uniform float uTime;
+out vec4 fragColor;
+void main(){
+  vec2 ndc = vClipPos.xy / vClipPos.w;
+  vec2 uv = ndc*0.5+0.5;
+
+  float ripple = sin(vWorldXZ.x*3.5 + uTime*0.6)*0.006 + cos(vWorldXZ.y*4.0 - uTime*0.5)*0.006;
+  uv += ripple;
+  uv = clamp(uv, vec2(0.001), vec2(0.999));
+
+  vec3 reflColor = texture(uReflection, uv).rgb;
+  vec3 waterTint = vec3(0.028,0.014,0.042);
+  vec3 color = mix(waterTint, reflColor, 0.78);
+
+  float distF = clamp(length(vWorldXZ)*0.10, 0.0, 0.55);
+  color = mix(color, waterTint, distF);
+
+  fragColor = vec4(color, 1.0);
+}`;
+
+/* ============================================================
+   WebGL init helpers
+   ============================================================ */
+function compileShader(gl, type, source){
+  const shader = gl.createShader(type);
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)){
+    const info = gl.getShaderInfoLog(shader);
+    gl.deleteShader(shader);
+    throw new Error('Shader compile error: ' + info);
+  }
+  return shader;
+}
+function createProgram(gl, vsSrc, fsSrc){
+  const vs = compileShader(gl, gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl, gl.FRAGMENT_SHADER, fsSrc);
+  const program = gl.createProgram();
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)){
+    const info = gl.getProgramInfoLog(program);
+    throw new Error('Program link error: ' + info);
+  }
+  return program;
+}
+function getLocs(gl, program, attribs, uniforms){
+  const loc = {};
+  for (const a of attribs) loc[a] = gl.getAttribLocation(program, a);
+  for (const u of uniforms) loc[u] = gl.getUniformLocation(program, u);
+  return loc;
+}
+
+/* ============================================================
+   Procedural tree generation
+   ============================================================ */
+function generateTree(){
+  const paths = [];
+  const canopyAttach = [];
+
+  function recurse(startPos, dir, length, radius, depth){
+    const pts = [{ pos: startPos.slice(), radius: radius }];
+    let pos = startPos.slice();
+    let d = normV(dir);
+    const steps = Math.max(3, Math.round(length*5));
+    const stepLen = length/steps;
+
+    for (let i=0;i<steps;i++){
+      const t = i/steps;
+      const gnarl = depth===0 ? 0.08 : (depth===1 ? 0.15 : 0.20);
+      d = normV([
+        d[0] + (Math.random()-0.5)*gnarl,
+        d[1] + (Math.random()-0.5)*gnarl*(depth>=2?1.4:0.5) + (depth>=2 ? -0.028 : 0.010),
+        d[2] + (Math.random()-0.5)*gnarl
+      ]);
+      pos = [pos[0]+d[0]*stepLen, pos[1]+d[1]*stepLen, pos[2]+d[2]*stepLen];
+      const r = radius*(1-t*0.3);
+      pts.push({ pos: pos.slice(), radius: r });
+
+      if (depth>=2 && Math.random()<0.45) canopyAttach.push({ pos: pos.slice() });
+      else if (depth===1 && Math.random()<0.12) canopyAttach.push({ pos: pos.slice() });
+    }
+
+    paths.push({ points: pts, depth: depth });
+
+    const endRadius = radius*0.7;
+    if (depth>=0 && depth<CFG.maxDepth && endRadius>CFG.minRadius){
+      const nChildren = depth===0 ? 4 : (depth===1 ? 3 : 2);
+      for (let c=0;c<nChildren;c++){
+        const spread = depth===0 ? 0.85 : 1.25;
+        const childDir = randomConeDir(d, spread);
+        recurse(pos, childDir, length*randRange(0.66,0.80), endRadius*randRange(0.58,0.74), depth+1);
+      }
+    }
+  }
+
+  recurse([0,0,0], [0,1,0], CFG.trunkHeight, CFG.trunkRadius, 0);
+
+  const numRoots = 6;
+  for (let i=0;i<numRoots;i++){
+    const ang = (i/numRoots)*Math.PI*2 + Math.random()*0.4;
+    const rootDir = normV([Math.cos(ang), -0.22+Math.random()*0.10, Math.sin(ang)]);
+    recurse([0,0.04,0], rootDir, 0.45+Math.random()*0.35, CFG.trunkRadius*0.6, -1);
+  }
+
+  return { paths: paths, canopyAttach: canopyAttach };
+}
+
+function buildTubeMesh(path, sides, positions, normals, indices){
+  const startIdx = positions.length/3;
+  let refUp = [0,1,0];
+  const pts = path.points;
+
+  for (let i=0;i<pts.length;i++){
+    let dir;
+    if (i===0) dir = normV(subV(pts[1].pos, pts[0].pos));
+    else if (i===pts.length-1) dir = normV(subV(pts[i].pos, pts[i-1].pos));
+    else dir = normV(subV(pts[i+1].pos, pts[i-1].pos));
+
+    let right = crossV(refUp, dir);
+    if (lenV(right) < 1e-5){
+      const arbitrary = Math.abs(dir[0])<0.9 ? [1,0,0] : [0,0,1];
+      right = crossV(arbitrary, dir);
+    }
+    right = normV(right);
+    const up = normV(crossV(dir, right));
+    refUp = up;
+
+    const r = pts[i].radius;
+    for (let s=0;s<sides;s++){
+      const ang = (s/sides)*Math.PI*2;
+      const cx = Math.cos(ang), cy = Math.sin(ang);
+      const px = pts[i].pos[0] + right[0]*cx*r + up[0]*cy*r;
+      const py = pts[i].pos[1] + right[1]*cx*r + up[1]*cy*r;
+      const pz = pts[i].pos[2] + right[2]*cx*r + up[2]*cy*r;
+      positions.push(px,py,pz);
+      const nx = right[0]*cx+up[0]*cy, ny = right[1]*cx+up[1]*cy, nz = right[2]*cx+up[2]*cy;
+      const nl = Math.hypot(nx,ny,nz) || 1;
+      normals.push(nx/nl, ny/nl, nz/nl);
+    }
+  }
+
+  for (let i=0;i<pts.length-1;i++){
+    for (let s=0;s<sides;s++){
+      const s2 = (s+1)%sides;
+      const a = startIdx + i*sides + s;
+      const b = startIdx + i*sides + s2;
+      const c = startIdx + (i+1)*sides + s;
+      const d = startIdx + (i+1)*sides + s2;
+      indices.push(a,b,c, b,d,c);
+    }
+  }
+}
+
+function buildTrunkGeometry(paths){
+  const positions = [];
+  const normals = [];
+  const indices = [];
+  for (const path of paths){
+    const sides = path.depth<=0 ? 8 : (path.depth===1 ? 7 : 6);
+    buildTubeMesh(path, sides, positions, normals, indices);
+  }
+  return {
+    positions: new Float32Array(positions),
+    normals: new Float32Array(normals),
+    indices: new Uint32Array(indices)
+  };
+}
+
+function buildFloretInstances(canopyAttach){
+  shuffleArray(canopyAttach);
+  const instances = [];
+
+  outer:
+  for (const attach of canopyAttach){
+    const numStrands = 1 + Math.floor(Math.random()*3);
+    for (let s=0; s<numStrands; s++){
+      const strandLen = 0.5 + Math.random()*Math.random()*2.2;
+      const phase = Math.random()*Math.PI*2;
+      const driftX = (Math.random()-0.5)*0.3;
+      const driftZ = (Math.random()-0.5)*0.3;
+      const offX = (Math.random()-0.5)*0.06;
+      const offZ = (Math.random()-0.5)*0.06;
+      const nFlorets = Math.max(4, Math.round(strandLen*32));
+      const spiralPhase = Math.random()*10;
+
+      for (let f=0; f<nFlorets; f++){
+        const t = f/nFlorets;
+        const y = attach.pos[1] - t*strandLen;
+        const droop = t*t;
+        const x = attach.pos[0] + offX + driftX*droop;
+        const z = attach.pos[2] + offZ + driftZ*droop;
+        const spiralR = 0.015 + 0.02*t;
+        const ang = f*2.399963 + spiralPhase;
+        const jx = Math.cos(ang)*spiralR;
+        const jz = Math.sin(ang)*spiralR;
+
+        instances.push({
+          pos: [x+jx, y, z+jz],
+          phase: phase + f*0.12,
+          heightT: t,
+          scale: (0.85+Math.random()*0.4) * CFG.floretSize,
+          seed: Math.random()
+        });
+
+        if (instances.length >= CFG.maxFlorets) break outer;
+      }
+    }
+  }
+  return instances;
+}
+
+function buildWaterPlane(){
+  const size = 18;
+  const y = -0.02;
+  return {
+    positions: new Float32Array([
+      -size,y,-size,  size,y,-size,  size,y,size,  -size,y,size
+    ]),
+    indices: new Uint16Array([0,1,2, 0,2,3])
+  };
+}
+
+/* ============================================================
+   App
+   ============================================================ */
+function main(){
+  const canvas = document.getElementById('glcanvas');
+  const gl = canvas.getContext('webgl2', { antialias:true, alpha:false, depth:true, powerPreference:'high-performance' });
+  if (!gl){
+    document.getElementById('loading').innerHTML =
+      '<div style="max-width:300px;text-align:center;line-height:1.7">عذراً، متصفحك لا يدعم WebGL2.<br>جرّب أحدث إصدار من Chrome أو Firefox أو Edge.</div>';
+    return;
+  }
+
+  gl.enable(gl.DEPTH_TEST);
+  gl.disable(gl.CULL_FACE);
+
+  const trunkProgram = createProgram(gl, TRUNK_VS, TRUNK_FS);
+  const trunkLoc = getLocs(gl, trunkProgram, ['aPosition','aNormal'], ['uView','uProj','uCameraPos']);
+
+  const floretProgram = createProgram(gl, FLORET_VS, FLORET_FS);
+  const floretLoc = getLocs(gl, floretProgram, ['aCorner','aUV','iBasePos','iPhase','iHeightT','iScale','iSeed'], ['uView','uProj','uTime','uWindStrength','uWindSpeed']);
+
+  const waterProgram = createProgram(gl, WATER_VS, WATER_FS);
+  const waterLoc = getLocs(gl, waterProgram, ['aPosition'], ['uView','uProj','uTime','uReflection']);
+
+  const tree = generateTree();
+  const trunkGeo = buildTrunkGeometry(tree.paths);
+  const floretInstances = buildFloretInstances(tree.canopyAttach);
+  const waterGeo = buildWaterPlane();
+
+  const trunkVAO = gl.createVertexArray();
+  gl.bindVertexArray(trunkVAO);
+  const trunkPosBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, trunkPosBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, trunkGeo.positions, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(trunkLoc.aPosition);
+  gl.vertexAttribPointer(trunkLoc.aPosition, 3, gl.FLOAT, false, 0, 0);
+
+  const trunkNormBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, trunkNormBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, trunkGeo.normals, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(trunkLoc.aNormal);
+  gl.vertexAttribPointer(trunkLoc.aNormal, 3, gl.FLOAT, false, 0, 0);
+
+  const trunkIdxBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, trunkIdxBuf);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, trunkGeo.indices, gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+
+  const n = floretInstances.length;
+  const iBasePos = new Float32Array(n*3);
+  const iPhase = new Float32Array(n);
+  const iHeightT = new Float32Array(n);
+  const iScale = new Float32Array(n);
+  const iSeed = new Float32Array(n);
+  for (let i=0;i<n;i++){
+    const it = floretInstances[i];
+    iBasePos[i*3]=it.pos[0]; iBasePos[i*3+1]=it.pos[1]; iBasePos[i*3+2]=it.pos[2];
+    iPhase[i]=it.phase;
+    iHeightT[i]=it.heightT;
+    iScale[i]=it.scale;
+    iSeed[i]=it.seed;
+  }
+
+  const floretVAO = gl.createVertexArray();
+  gl.bindVertexArray(floretVAO);
+
+  const cornerBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, cornerBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-0.5,-0.5, 0.5,-0.5, 0.5,0.5, -0.5,0.5]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(floretLoc.aCorner);
+  gl.vertexAttribPointer(floretLoc.aCorner, 2, gl.FLOAT, false, 0, 0);
+
+  const uvBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,0, 1,0, 1,1, 0,1]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(floretLoc.aUV);
+  gl.vertexAttribPointer(floretLoc.aUV, 2, gl.FLOAT, false, 0, 0);
+
+  function instAttr(loc, data, size){
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+    gl.vertexAttribDivisor(loc, 1);
+  }
+  instAttr(floretLoc.iBasePos, iBasePos, 3);
+  instAttr(floretLoc.iPhase, iPhase, 1);
+  instAttr(floretLoc.iHeightT, iHeightT, 1);
+  instAttr(floretLoc.iScale, iScale, 1);
+  instAttr(floretLoc.iSeed, iSeed, 1);
+
+  const floretIdxBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, floretIdxBuf);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0,1,2, 0,2,3]), gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+
+  const waterVAO = gl.createVertexArray();
+  gl.bindVertexArray(waterVAO);
+  const waterPosBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, waterPosBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, waterGeo.positions, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(waterLoc.aPosition);
+  gl.vertexAttribPointer(waterLoc.aPosition, 3, gl.FLOAT, false, 0, 0);
+  const waterIdxBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, waterIdxBuf);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, waterGeo.indices, gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+
+  let reflFBO = null;
+  function destroyReflFBO(){
+    if (!reflFBO) return;
+    gl.deleteTexture(reflFBO.tex);
+    gl.deleteRenderbuffer(reflFBO.depthRB);
+    gl.deleteFramebuffer(reflFBO.fbo);
+    reflFBO = null;
+  }
+  function createReflFBO(w,h){
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+
+    const depthRB = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, depthRB);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, w, h);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depthRB);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { fbo: fbo, tex: tex, depthRB: depthRB, width:w, height:h };
+  }
+
+  const cameraTarget = [0, 1.25, 0];
+  let camAzimuth = 0.5, camElevation = 0.32, camRadius = 6.2;
+  let targetAzimuth = camAzimuth, targetElevation = camElevation, targetRadius = camRadius;
+  let isDragging = false, lastPX=0, lastPY=0;
+  let autoRotate = true, autoRotateTimer = null;
+
+  canvas.addEventListener('pointerdown', function(e){
+    isDragging = true; lastPX=e.clientX; lastPY=e.clientY;
+    autoRotate = false;
+    canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener('pointermove', function(e){
+    if (!isDragging) return;
+    const dx = e.clientX-lastPX, dy = e.clientY-lastPY;
+    lastPX = e.clientX; lastPY = e.clientY;
+    targetAzimuth -= dx*0.005;
+    targetElevation = clampN(targetElevation + dy*0.005, -0.15, 1.3);
+  });
+  window.addEventListener('pointerup', function(){
+    isDragging = false;
+    clearTimeout(autoRotateTimer);
+    autoRotateTimer = setTimeout(function(){ autoRotate = true; }, 3500);
+  });
+  canvas.addEventListener('wheel', function(e){
+    e.preventDefault();
+    targetRadius = clampN(targetRadius + e.deltaY*0.005, 3.0, 14.0);
+  }, { passive:false });
+
+  function updateCamera(dt){
+    if (autoRotate) targetAzimuth += dt*0.06;
+    const k = Math.min(1, dt*4);
+    camAzimuth += (targetAzimuth-camAzimuth)*k;
+    camElevation += (targetElevation-camElevation)*k;
+    camRadius += (targetRadius-camRadius)*k;
+  }
+  function computeEye(){
+    return [
+      cameraTarget[0] + camRadius*Math.cos(camElevation)*Math.sin(camAzimuth),
+      cameraTarget[1] + camRadius*Math.sin(camElevation),
+      cameraTarget[2] + camRadius*Math.cos(camElevation)*Math.cos(camAzimuth)
+    ];
+  }
+
+  const viewMatrix = M4.create();
+  const projMatrix = M4.create();
+  const reflViewMatrix = M4.create();
+  const reflProjMatrix = M4.create();
+
+  function resize(){
+    const dpr = Math.min(window.devicePixelRatio||1, CFG.maxDPR);
+    const w = Math.max(1, Math.floor(canvas.clientWidth*dpr));
+    const h = Math.max(1, Math.floor(canvas.clientHeight*dpr));
+    if (canvas.width!==w || canvas.height!==h){
+      canvas.width = w; canvas.height = h;
+      M4.perspective(projMatrix, CFG.fov, w/h, CFG.near, CFG.far);
+      destroyReflFBO();
+      reflFBO = createReflFBO(Math.max(1,Math.floor(w*CFG.reflectionScale)), Math.max(1,Math.floor(h*CFG.reflectionScale)));
+    }
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  function drawScene(view, proj, eyePos, time, isReflection){
+    if (!isReflection){
+      gl.useProgram(waterProgram);
+      gl.uniformMatrix4fv(waterLoc.uView, false, view);
+      gl.uniformMatrix4fv(waterLoc.uProj, false, proj);
+      gl.uniform1f(waterLoc.uTime, time);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, reflFBO.tex);
+      gl.uniform1i(waterLoc.uReflection, 0);
+      gl.bindVertexArray(waterVAO);
+      gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+    }
+
+    gl.useProgram(trunkProgram);
+    gl.uniformMatrix4fv(trunkLoc.uView, false, view);
+    gl.uniformMatrix4fv(trunkLoc.uProj, false, proj);
+    gl.uniform3fv(trunkLoc.uCameraPos, eyePos);
+    gl.bindVertexArray(trunkVAO);
+    gl.drawElements(gl.TRIANGLES, trunkGeo.indices.length, gl.UNSIGNED_INT, 0);
+
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.depthMask(false);
+    gl.useProgram(floretProgram);
+    gl.uniformMatrix4fv(floretLoc.uView, false, view);
+    gl.uniformMatrix4fv(floretLoc.uProj, false, proj);
+    gl.uniform1f(floretLoc.uTime, time);
+    gl.uniform1f(floretLoc.uWindStrength, CFG.windStrength);
+    gl.uniform1f(floretLoc.uWindSpeed, CFG.windSpeed);
+    gl.bindVertexArray(floretVAO);
+    gl.drawElementsInstanced(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0, n);
+    gl.depthMask(true);
+    gl.disable(gl.BLEND);
+  }
+
+  function renderReflection(eye, time){
+    const reflEye = [eye[0], -eye[1], eye[2]];
+    const reflTarget = [cameraTarget[0], -cameraTarget[1], cameraTarget[2]];
+    M4.lookAt(reflViewMatrix, reflEye, reflTarget, [0,-1,0]);
+    M4.perspective(reflProjMatrix, CFG.fov, reflFBO.width/reflFBO.height, CFG.near, CFG.far);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, reflFBO.fbo);
+    gl.viewport(0,0,reflFBO.width, reflFBO.height);
+    gl.clearColor(0.024,0.010,0.036,1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+    drawScene(reflViewMatrix, reflProjMatrix, reflEye, time, true);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  let lastTime = performance.now()*0.001;
+  let frameCount = 0;
+  let rafId = null;
+  const loadingEl = document.getElementById('loading');
+  const hintEl = document.getElementById('hint');
+  let firstFrame = true;
+
+  function render(nowMs){
+    const now = nowMs*0.001;
+    const dt = Math.min(now-lastTime, 0.05);
+    lastTime = now;
+    frameCount++;
+
+    updateCamera(dt);
+    const eye = computeEye();
+    M4.lookAt(viewMatrix, eye, cameraTarget, [0,1,0]);
+
+    if (frameCount % 2 === 0) renderReflection(eye, now);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0,0,canvas.width, canvas.height);
+    gl.clearColor(0.024,0.010,0.036,1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+    drawScene(viewMatrix, projMatrix, eye, now, false);
+
+    if (firstFrame){
+      firstFrame = false;
+      loadingEl.classList.add('fade-out');
+      setTimeout(function(){ loadingEl.style.display='none'; }, 900);
+      setTimeout(function(){ hintEl.classList.add('fade-out'); }, 4500);
+    }
+
+    rafId = requestAnimationFrame(render);
+  }
+  rafId = requestAnimationFrame(render);
+
+  document.addEventListener('visibilitychange', function(){
+    if (document.hidden){
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = null;
+    } else if (!rafId){
+      lastTime = performance.now()*0.001;
+      rafId = requestAnimationFrame(render);
+    }
+  });
+}
+
+try {
+  main();
+} catch (err){
+  console.error(err);
+  const loadingEl = document.getElementById('loading');
+  if (loadingEl){
+    loadingEl.innerHTML = '<div style="max-width:320px;text-align:center;line-height:1.7">حدث خطأ أثناء بناء المشهد:<br>' + (err && err.message ? err.message : err) + '</div>';
+  }
+}
+</script>
+</body>
+</html>
